@@ -90,6 +90,7 @@ typedef struct reduce_outer_joins_pass1_state
 	bool		contains_outer; /* does subtree contain outer join(s)? */
 	Relids		nullable_rels;	/* base relids that are nullable within this
 								 * subtree */
+	Node	   *jtnode;			/* the jointree node this state describes */
 	List	   *sub_states;		/* List of states for subtree components */
 } reduce_outer_joins_pass1_state;
 
@@ -163,16 +164,23 @@ static void reduce_outer_joins_pass2(Node *jtnode,
 									 List *forced_null_vars);
 static void report_reduced_full_join(reduce_outer_joins_pass2_state *state2,
 									 int rtindex, Relids relids);
-static bool has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
-								   reduce_outer_joins_pass1_state *right_state);
+static bool forced_null_var_is_attnotnull(PlannerInfo *root,
+										  List *forced_null_vars,
+										  reduce_outer_joins_pass1_state *state);
+static bool forced_null_var_is_nonnullable(PlannerInfo *root,
+										   List *forced_null_vars,
+										   reduce_outer_joins_pass1_state *state,
+										   List *extra_quals);
 static Node *remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
+											Relids baserels,
 											Node **parent_quals,
 											Relids *dropped_outer_joins);
 static int	get_result_relid(PlannerInfo *root, Node *jtnode);
 static void remove_result_refs(PlannerInfo *root, int varno, Node *newjtloc);
-static bool find_dependent_phvs(PlannerInfo *root, int varno);
+static bool find_dependent_phvs(PlannerInfo *root, int varno, Relids baserels);
 static bool find_dependent_phvs_in_jointree(PlannerInfo *root,
-											Node *node, int varno);
+											Node *node, int varno,
+											Relids baserels);
 static void substitute_phv_relids(Node *node,
 								  int varno, Relids subrelids);
 static void fix_append_rel_relids(PlannerInfo *root, int varno,
@@ -556,8 +564,7 @@ expand_virtual_generated_columns(PlannerInfo *root, Query *parse,
 		/* this flag will be set below, if needed */
 		rvcontext.wrap_option = REPLACE_WRAP_NONE;
 		/* initialize cache array with indexes 0 .. length(tlist) */
-		rvcontext.rv_cache = palloc0((list_length(tlist) + 1) *
-									 sizeof(Node *));
+		rvcontext.rv_cache = palloc0_array(Node *, list_length(tlist) + 1);
 
 		/*
 		 * If the query uses grouping sets, we need a PlaceHolderVar for each
@@ -1596,8 +1603,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	/* this flag will be set below, if needed */
 	rvcontext.wrap_option = REPLACE_WRAP_NONE;
 	/* initialize cache array with indexes 0 .. length(tlist) */
-	rvcontext.rv_cache = palloc0((list_length(subquery->targetList) + 1) *
-								 sizeof(Node *));
+	rvcontext.rv_cache = palloc0_array(Node *, list_length(subquery->targetList) + 1);
 
 	/*
 	 * If the parent query uses grouping sets, we need a PlaceHolderVar for
@@ -1923,8 +1929,7 @@ make_setop_translation_list(Query *query, int newvarno,
 	/* Initialize reverse-translation array with all entries zero */
 	/* (entries for resjunk columns will stay that way) */
 	appinfo->num_child_cols = list_length(query->targetList);
-	appinfo->parent_colnos = pcolnos =
-		(AttrNumber *) palloc0(appinfo->num_child_cols * sizeof(AttrNumber));
+	appinfo->parent_colnos = pcolnos = palloc0_array(AttrNumber, appinfo->num_child_cols);
 
 	foreach(l, query->targetList)
 	{
@@ -2141,8 +2146,7 @@ pull_up_simple_values(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte)
 	rvcontext.varno = varno;
 	rvcontext.wrap_option = REPLACE_WRAP_NONE;
 	/* initialize cache array with indexes 0 .. length(tlist) */
-	rvcontext.rv_cache = palloc0((list_length(tlist) + 1) *
-								 sizeof(Node *));
+	rvcontext.rv_cache = palloc0_array(Node *, list_length(tlist) + 1);
 
 	/*
 	 * Replace all of the top query's references to the RTE's outputs with
@@ -2309,8 +2313,7 @@ pull_up_constant_function(PlannerInfo *root, Node *jtnode,
 	/* this flag will be set below, if needed */
 	rvcontext.wrap_option = REPLACE_WRAP_NONE;
 	/* initialize cache array with indexes 0 .. length(tlist) */
-	rvcontext.rv_cache = palloc0((list_length(rvcontext.targetlist) + 1) *
-								 sizeof(Node *));
+	rvcontext.rv_cache = palloc0_array(Node *, list_length(rvcontext.targetlist) + 1);
 
 	/*
 	 * If the parent query uses grouping sets, we need a PlaceHolderVar for
@@ -3232,15 +3235,27 @@ flatten_simple_union_all(PlannerInfo *root)
  *
  * Another transformation we apply here is to recognize cases like
  *		SELECT ... FROM a LEFT JOIN b ON (a.x = b.y) WHERE b.z IS NULL;
- * If we can prove that b.z must be non-null for any matching row, either
- * because the join clause is strict for b.z and b.z happens to be the join
- * key b.y, or because b.z is defined NOT NULL by table constraints and is
- * not nullable due to lower-level outer joins, then only null-extended rows
- * could pass the upper WHERE, and we can conclude that what the query is
- * really specifying is an anti-semijoin.  We change the join type from
- * JOIN_LEFT to JOIN_ANTI.  The IS NULL clause then becomes redundant, and
- * must be removed to prevent bogus selectivity calculations, but we leave
- * it to distribute_qual_to_rels to get rid of such clauses.
+ * If we can prove that b.z must be non-null for any matching row, because
+ * the join clause is strict for b.z and b.z happens to be the join key b.y,
+ * because a strict qual within b's own subtree forces b.z non-null, or
+ * because b.z is defined NOT NULL by table constraints and is not nullable
+ * due to lower-level outer joins, then only null-extended rows could pass
+ * the upper WHERE, and we can conclude that what the query is really
+ * specifying is an anti-semijoin.  We change the join type from JOIN_LEFT
+ * to JOIN_ANTI.  The IS NULL clause then becomes redundant, and must be
+ * removed to prevent bogus selectivity calculations, but we leave it to
+ * distribute_qual_to_rels to get rid of such clauses.
+ *
+ * A whole-row Var works too.  "WHERE b IS NULL" in row-format semantics is
+ * true when b's whole-row value is NULL or when every column of b is NULL;
+ * for a matching row only the latter is possible, so proving any one column
+ * of b non-null in matching rows justifies the same reduction.
+ *
+ * The same recognition reduces a FULL join to an anti-semijoin when a
+ * forced-null Var on either side is proven non-null: only the other side's
+ * unmatched rows can survive.  If that surviving side is the right-hand
+ * input, we switch the inputs (as we do for JOIN_RIGHT below) so that it
+ * ends up on the left, where JOIN_ANTI requires the surviving side to be.
  *
  * Also, we get rid of JOIN_RIGHT cases by flipping them around to become
  * JOIN_LEFT.  This saves some code here and in some later planner routines;
@@ -3335,6 +3350,7 @@ reduce_outer_joins_pass1(Node *jtnode)
 	result->relids = NULL;
 	result->contains_outer = false;
 	result->nullable_rels = NULL;
+	result->jtnode = jtnode;
 	result->sub_states = NIL;
 
 	if (jtnode == NULL)
@@ -3517,12 +3533,48 @@ reduce_outer_joins_pass2(Node *jtnode,
 												 right_state->relids);
 					}
 				}
-				else
+				else if (bms_overlap(nonnullable_rels, right_state->relids))
 				{
-					if (bms_overlap(nonnullable_rels, right_state->relids))
+					jointype = JOIN_RIGHT;
+					/* Also report partial reduction in state2 */
+					report_reduced_full_join(state2, rtindex,
+											 left_state->relids);
+				}
+				else if (forced_null_vars != NIL)
+				{
+					/*
+					 * Neither side is forced non-null by a strict upper qual,
+					 * but an upper qual may force a Var on one side to be
+					 * NULL while that Var is non-null in every row that side
+					 * emits (proven by quals within the side's own subtree,
+					 * or a NOT NULL constraint).  Then only rows where that
+					 * side was null-extended can satisfy the upper qual: the
+					 * matched rows and that side's unmatched rows all drop
+					 * out, leaving an anti-join.
+					 *
+					 * Unlike the JOIN_LEFT case below, we must not consult
+					 * the join's own ON quals here: they do not hold for the
+					 * unmatched rows that this proof has to cover.
+					 *
+					 * If the constrained Var is on the RHS the result is a
+					 * plain anti-join; if it is on the LHS it is a right
+					 * anti-join, which the input-switching step below
+					 * normalizes to a plain anti-join (just as it does for
+					 * JOIN_RIGHT).
+					 */
+					if (forced_null_var_is_nonnullable(root,
+													   forced_null_vars,
+													   right_state, NIL))
 					{
-						jointype = JOIN_RIGHT;
-						/* Also report partial reduction in state2 */
+						jointype = JOIN_ANTI;
+						report_reduced_full_join(state2, rtindex,
+												 right_state->relids);
+					}
+					else if (forced_null_var_is_nonnullable(root,
+															forced_null_vars,
+															left_state, NIL))
+					{
+						jointype = JOIN_RIGHT_ANTI;
 						report_reduced_full_join(state2, rtindex,
 												 left_state->relids);
 					}
@@ -3535,7 +3587,9 @@ reduce_outer_joins_pass2(Node *jtnode,
 				 * These could only have been introduced by pull_up_sublinks,
 				 * so there's no way that upper quals could refer to their
 				 * righthand sides, and no point in checking.  We don't expect
-				 * to see JOIN_RIGHT_SEMI or JOIN_RIGHT_ANTI yet.
+				 * a JOIN_RIGHT_SEMI or JOIN_RIGHT_ANTI input here; the
+				 * JOIN_FULL case above produces JOIN_RIGHT_ANTI only as a
+				 * transient, which is converted to JOIN_ANTI below.
 				 */
 				break;
 			default:
@@ -3545,20 +3599,22 @@ reduce_outer_joins_pass2(Node *jtnode,
 		}
 
 		/*
-		 * Convert JOIN_RIGHT to JOIN_LEFT.  Note that in the case where we
-		 * reduced JOIN_FULL to JOIN_RIGHT, this will mean the JoinExpr no
-		 * longer matches the internal ordering of any CoalesceExpr's built to
-		 * represent merged join variables.  We don't care about that at
-		 * present, but be wary of it ...
+		 * Convert JOIN_RIGHT to JOIN_LEFT, and likewise the JOIN_RIGHT_ANTI
+		 * that the JOIN_FULL arm may have produced just above to JOIN_ANTI,
+		 * by switching the inputs.  Note that in the case where we reduced
+		 * JOIN_FULL this way, this will mean the JoinExpr no longer matches
+		 * the internal ordering of any CoalesceExpr's built to represent
+		 * merged join variables.  We don't care about that at present, but be
+		 * wary of it ...
 		 */
-		if (jointype == JOIN_RIGHT)
+		if (jointype == JOIN_RIGHT || jointype == JOIN_RIGHT_ANTI)
 		{
 			Node	   *tmparg;
 
 			tmparg = j->larg;
 			j->larg = j->rarg;
 			j->rarg = tmparg;
-			jointype = JOIN_LEFT;
+			jointype = (jointype == JOIN_RIGHT) ? JOIN_LEFT : JOIN_ANTI;
 			right_state = linitial(state1->sub_states);
 			left_state = lsecond(state1->sub_states);
 		}
@@ -3566,33 +3622,23 @@ reduce_outer_joins_pass2(Node *jtnode,
 		/*
 		 * See if we can reduce JOIN_LEFT to JOIN_ANTI.  This is the case if
 		 * any var from the RHS was forced null by higher qual levels, but is
-		 * known to be non-nullable.  We detect this either by seeing if the
-		 * join's own quals are strict for the var, or by checking if the var
-		 * is defined NOT NULL by table constraints (being careful to exclude
-		 * vars that are nullable due to lower-level outer joins).  In either
-		 * case, the only way the higher qual clause's requirement for NULL
-		 * can be met is if the join fails to match, producing a null-extended
-		 * row.  Thus, we can treat this as an anti-join.
+		 * known to be non-nullable in any matching row.  We can prove that in
+		 * any of these ways: the join's own quals are strict for the var;
+		 * strict quals applied within the RHS subtree prove it; or the var is
+		 * defined NOT NULL by table constraints (being careful to exclude
+		 * vars that are nullable due to lower-level outer joins).  In each
+		 * such case, the only way the higher qual clause's requirement for
+		 * NULL can be met is if the join fails to match, producing a
+		 * null-extended row.  Thus, we can treat this as an anti-join.
 		 */
 		if (jointype == JOIN_LEFT && forced_null_vars != NIL)
 		{
-			List	   *nonnullable_vars;
-			Bitmapset  *overlap;
-
-			/* Find Vars in j->quals that must be non-null in joined rows */
-			nonnullable_vars = find_nonnullable_vars(j->quals);
-
 			/*
-			 * It's not sufficient to check whether nonnullable_vars and
-			 * forced_null_vars overlap: we need to know if the overlap
-			 * includes any RHS variables.
-			 *
-			 * Also check if any forced-null var is defined NOT NULL by table
-			 * constraints.
+			 * A forced-null RHS Var that is proven non-null can be NULL here
+			 * only by null-extension.  That makes this an anti-join.
 			 */
-			overlap = mbms_overlap_sets(nonnullable_vars, forced_null_vars);
-			if (bms_overlap(overlap, right_state->relids) ||
-				has_notnull_forced_var(root, forced_null_vars, right_state))
+			if (forced_null_var_is_nonnullable(root, forced_null_vars,
+											   right_state, (List *) j->quals))
 				jointype = JOIN_ANTI;
 		}
 
@@ -3729,10 +3775,13 @@ report_reduced_full_join(reduce_outer_joins_pass2_state *state2,
 }
 
 /*
- * has_notnull_forced_var
+ * forced_null_var_is_attnotnull
  *		Check if "forced_null_vars" contains any Vars belonging to the subtree
- *		indicated by "right_state" that are known to be non-nullable due to
- *		table constraints.
+ *		indicated by "state" that are known to be non-nullable due to table
+ *		constraints.
+ *
+ * A whole-row Var, in any matching row, requires every column of its relation
+ * to be NULL, so any NOT NULL column of the relation refutes it.
  *
  * Note that we must also consider the situation where a NOT NULL Var can be
  * nulled by lower-level outer joins.
@@ -3740,8 +3789,8 @@ report_reduced_full_join(reduce_outer_joins_pass2_state *state2,
  * Helper for reduce_outer_joins_pass2.
  */
 static bool
-has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
-					   reduce_outer_joins_pass1_state *right_state)
+forced_null_var_is_attnotnull(PlannerInfo *root, List *forced_null_vars,
+							  reduce_outer_joins_pass1_state *state)
 {
 	int			varno = -1;
 
@@ -3749,8 +3798,9 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 	{
 		RangeTblEntry *rte;
 		Bitmapset  *notnullattnums;
-		Bitmapset  *forcednullattnums = NULL;
-		int			attno;
+		Bitmapset  *forcednullattnums;
+		bool		wholerow = false;
+		int			lowest_attno;
 
 		varno++;
 
@@ -3759,7 +3809,7 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 			continue;
 
 		/* Skip Vars that do not belong to the target relations */
-		if (!bms_is_member(varno, right_state->relids))
+		if (!bms_is_member(varno, state->relids))
 			continue;
 
 		/*
@@ -3767,34 +3817,28 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 		 * given subtree.  These Vars might be NULL even if the schema defines
 		 * them as NOT NULL.
 		 */
-		if (bms_is_member(varno, right_state->nullable_rels))
+		if (bms_is_member(varno, state->nullable_rels))
 			continue;
 
-		/*
-		 * Iterate over attributes and adjust the bitmap indexes by
-		 * FirstLowInvalidHeapAttributeNumber to get the actual attribute
-		 * numbers.
-		 */
-		attno = -1;
-		while ((attno = bms_next_member(attrs, attno)) >= 0)
-		{
-			AttrNumber	real_attno = attno + FirstLowInvalidHeapAttributeNumber;
+		/* find the lowest member to check if system columns are present */
+		lowest_attno = bms_next_member(attrs, -1);
 
-			/* system columns cannot be NULL */
-			if (real_attno < 0)
-				return true;
+		/* we checked for an empty set above */
+		Assert(lowest_attno >= 0);
 
-			forcednullattnums = bms_add_member(forcednullattnums, real_attno);
-		}
+		/* system columns cannot be NULL */
+		if (lowest_attno + FirstLowInvalidHeapAttributeNumber < 0)
+			return true;
+
+		/* attno 0 is a whole-row Var, which forces every column null */
+		if (lowest_attno + FirstLowInvalidHeapAttributeNumber == 0)
+			wholerow = true;
 
 		rte = rt_fetch(varno, root->parse->rtable);
 
 		/* We can only reason about ordinary relations */
 		if (rte->rtekind != RTE_RELATION)
-		{
-			bms_free(forcednullattnums);
 			continue;
-		}
 
 		/*
 		 * We must skip inheritance parent tables, as some child tables may
@@ -3802,13 +3846,25 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 		 * cannot happen with partitioned tables, though.
 		 */
 		if (rte->inh && rte->relkind != RELKIND_PARTITIONED_TABLE)
-		{
-			bms_free(forcednullattnums);
 			continue;
-		}
 
 		/* Get the column not-null constraint information for this relation */
 		notnullattnums = find_relation_notnullatts(root, rte->relid);
+
+		/*
+		 * A forced-null whole-row Var, in any matching row, requires every
+		 * column of the relation to be NULL, so any NOT NULL column refutes
+		 * it.
+		 */
+		if (wholerow && !bms_is_empty(notnullattnums))
+			return true;
+
+		/*
+		 * Offset the bitmap members by FirstLowInvalidHeapAttributeNumber to
+		 * get the actual attribute numbers.
+		 */
+		forcednullattnums = bms_offset_members(attrs,
+											   FirstLowInvalidHeapAttributeNumber);
 
 		/*
 		 * Check if any forced-null attributes are defined as NOT NULL by
@@ -3824,6 +3880,93 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 	}
 
 	return false;
+}
+
+/*
+ * forced_null_var_is_nonnullable
+ *		Detect whether some Var that "forced_null_vars" requires to be NULL is
+ *		actually non-nullable in every row that the given subtree emits.
+ *
+ * We prove non-nullness from quals that hold for every such row: the subtree's
+ * safe quals, plus any "extra_quals" the caller knows also constrain the Var,
+ * or a NOT NULL table constraint (excluding Vars nullable due to lower-level
+ * outer joins).
+ *
+ * A whole-row Var in "forced_null_vars" requires, in any matching row, every
+ * column of its relation to be NULL, so it is refuted by proving any one of
+ * those columns non-null.
+ *
+ * Helper for reduce_outer_joins_pass2.
+ */
+static bool
+forced_null_var_is_nonnullable(PlannerInfo *root, List *forced_null_vars,
+							   reduce_outer_joins_pass1_state *state,
+							   List *extra_quals)
+{
+	List	   *all_quals = NIL;
+	List	   *nonnullable_vars;
+	int			wholerow_attno = 0 - FirstLowInvalidHeapAttributeNumber;
+	int			varno = -1;
+
+	find_safe_quals(state->jtnode, &all_quals);
+	all_quals = list_concat(all_quals, extra_quals);
+	nonnullable_vars = find_nonnullable_vars((Node *) all_quals);
+
+	/*
+	 * It's not sufficient to consider all matches between nonnullable_vars
+	 * and forced_null_vars: a match counts only for a Var belonging to this
+	 * subtree, and the whole-row attribute needs special treatment.
+	 */
+	foreach_node(Bitmapset, attrs, forced_null_vars)
+	{
+		Bitmapset  *nonnull_attrs;
+
+		varno++;
+
+		/* Beyond the end of nonnullable_vars there is nothing left to prove */
+		if (varno >= list_length(nonnullable_vars))
+			break;
+
+		/* Skip empty bitmaps */
+		if (bms_is_empty(attrs))
+			continue;
+
+		/* Skip Vars that do not belong to the target relations */
+		if (!bms_is_member(varno, state->relids))
+			continue;
+
+		/* Get what the quals prove non-null for this relation, if anything */
+		nonnull_attrs = list_nth_node(Bitmapset, nonnullable_vars, varno);
+
+		/*
+		 * A proof for the whole-row attribute refutes nothing: it shows only
+		 * that the composite datum is non-null, and such a datum can still
+		 * have all columns NULL.  Discard it up front.
+		 */
+		nonnull_attrs = bms_del_member(nonnull_attrs, wholerow_attno);
+
+		/* A forced-null attribute that is proven non-null settles it. */
+		if (bms_overlap(attrs, nonnull_attrs))
+			return true;
+
+		/*
+		 * So does any real column proven non-null, if the whole-row Var is
+		 * forced null: in a matching row (whose whole-row datum is non-null)
+		 * the row-format IS NULL test is true only when every column is NULL.
+		 * System attributes don't count, since they are not part of the row
+		 * value; conveniently they sort below the whole-row attribute in the
+		 * bitmap.
+		 */
+		if (bms_is_member(wholerow_attno, attrs) &&
+			bms_next_member(nonnull_attrs, wholerow_attno) >= 0)
+			return true;
+	}
+
+	/*
+	 * Otherwise, check if any forced-null var is defined NOT NULL by table
+	 * constraints.
+	 */
+	return forced_null_var_is_attnotnull(root, forced_null_vars, state);
 }
 
 
@@ -3886,8 +4029,18 @@ has_notnull_forced_var(PlannerInfo *root, List *forced_null_vars,
 void
 remove_useless_result_rtes(PlannerInfo *root)
 {
+	Relids		baserels = NULL;
 	Relids		dropped_outer_joins = NULL;
 	ListCell   *cell;
+
+	/*
+	 * We'll need the set of baserels in the jointree to perform
+	 * find_dependent_phvs() checks.  But if there are no PHVs anywhere in the
+	 * query, those checks are no-ops, so we can skip the work.
+	 */
+	if (root->glob->lastPHId != 0)
+		baserels = get_relids_in_jointree((Node *) root->parse->jointree,
+										  false, false);
 
 	/* Top level of jointree must always be a FromExpr */
 	Assert(IsA(root->parse->jointree, FromExpr));
@@ -3895,6 +4048,7 @@ remove_useless_result_rtes(PlannerInfo *root)
 	root->parse->jointree = (FromExpr *)
 		remove_useless_results_recurse(root,
 									   (Node *) root->parse->jointree,
+									   baserels,
 									   NULL,
 									   &dropped_outer_joins);
 	/* We should still have a FromExpr */
@@ -3955,9 +4109,13 @@ remove_useless_result_rtes(PlannerInfo *root)
  * the parent's quals list; otherwise, pass NULL for parent_quals.
  * (Note that in some cases, parent_quals points to the quals of a parent
  * more than one level up in the tree.)
+ *
+ * baserels is the set of base (non-join) RT indexes in the whole jointree;
+ * it can be NULL if the query contains no PHVs.
  */
 static Node *
 remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
+							   Relids baserels,
 							   Node **parent_quals,
 							   Relids *dropped_outer_joins)
 {
@@ -3988,6 +4146,7 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 
 			/* Recursively transform child, allowing it to push up quals ... */
 			child = remove_useless_results_recurse(root, child,
+												   baserels,
 												   &f->quals,
 												   dropped_outer_joins);
 			/* ... and stick it back into the tree */
@@ -4001,7 +4160,8 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 			 */
 			if (list_length(f->fromlist) > 1 &&
 				(varno = get_result_relid(root, child)) != 0 &&
-				!find_dependent_phvs_in_jointree(root, (Node *) f, varno))
+				!find_dependent_phvs_in_jointree(root, (Node *) f, varno,
+												 baserels))
 			{
 				f->fromlist = foreach_delete_current(f->fromlist, cell);
 				result_relids = bms_add_member(result_relids, varno);
@@ -4070,12 +4230,14 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 		 * quals up, or at least there's no particular reason to.
 		 */
 		j->larg = remove_useless_results_recurse(root, j->larg,
+												 baserels,
 												 (j->jointype == JOIN_INNER) ?
 												 &j->quals :
 												 (j->jointype == JOIN_LEFT) ?
 												 parent_quals : NULL,
 												 dropped_outer_joins);
 		j->rarg = remove_useless_results_recurse(root, j->rarg,
+												 baserels,
 												 (j->jointype == JOIN_INNER ||
 												  j->jointype == JOIN_LEFT) ?
 												 &j->quals : NULL,
@@ -4103,7 +4265,8 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 				 * allowed to have such refs.
 				 */
 				if ((varno = get_result_relid(root, j->larg)) != 0 &&
-					!find_dependent_phvs_in_jointree(root, j->rarg, varno))
+					!find_dependent_phvs_in_jointree(root, j->rarg, varno,
+													 baserels))
 				{
 					remove_result_refs(root, varno, j->rarg);
 					if (j->quals != NULL && parent_quals == NULL)
@@ -4158,7 +4321,7 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 				 */
 				if ((varno = get_result_relid(root, j->rarg)) != 0 &&
 					(j->quals == NULL ||
-					 !find_dependent_phvs(root, varno)))
+					 !find_dependent_phvs(root, varno, baserels)))
 				{
 					remove_result_refs(root, varno, j->larg);
 					*dropped_outer_joins = bms_add_member(*dropped_outer_joins,
@@ -4280,8 +4443,18 @@ remove_result_refs(PlannerInfo *root, int varno, Node *newjtloc)
 
 
 /*
- * find_dependent_phvs - are there any PlaceHolderVars whose relids are
+ * find_dependent_phvs - are there any PlaceHolderVars whose base relids are
  * exactly the given varno?
+ *
+ * We ignore outer-join relids present in a PHV's phrels, by intersecting
+ * with the caller-supplied "baserels" set.  This is necessary in part
+ * because some of the OJ relids may be stale, that is we may have
+ * already decided to remove those joins in remove_useless_result_rtes
+ * and not yet have cleaned their relid bits out of upper PHVs.
+ * But in general, it's the set of baserels that identify possible places
+ * to evaluate a PHV, and we mustn't let that go to empty.  (The caller is
+ * allowed to pass baserels as NULL if the query contains no PHVs at all,
+ * since then there is no work to do anyway.)
  *
  * find_dependent_phvs should be used when we want to see if there are
  * any such PHVs anywhere in the Query.  Another use-case is to see if
@@ -4292,8 +4465,9 @@ remove_result_refs(PlannerInfo *root, int varno, Node *newjtloc)
 
 typedef struct
 {
-	Relids		relids;
-	int			sublevels_up;
+	Relids		relids;			/* target relid, represented as a relid set */
+	Relids		baserels;		/* base RT indexes in query, NULL if no PHVs */
+	int			sublevels_up;	/* current nesting level */
 } find_dependent_phvs_context;
 
 static bool
@@ -4306,9 +4480,16 @@ find_dependent_phvs_walker(Node *node,
 	{
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
 
-		if (phv->phlevelsup == context->sublevels_up &&
-			bms_equal(context->relids, phv->phrels))
-			return true;
+		if (phv->phlevelsup == context->sublevels_up)
+		{
+			Relids		phbaserels = bms_intersect(phv->phrels,
+												   context->baserels);
+			bool		match = bms_equal(context->relids, phbaserels);
+
+			bms_free(phbaserels);
+			if (match)
+				return true;
+		}
 		/* fall through to examine children */
 	}
 	if (IsA(node, Query))
@@ -4332,7 +4513,7 @@ find_dependent_phvs_walker(Node *node,
 }
 
 static bool
-find_dependent_phvs(PlannerInfo *root, int varno)
+find_dependent_phvs(PlannerInfo *root, int varno, Relids baserels)
 {
 	find_dependent_phvs_context context;
 
@@ -4341,6 +4522,7 @@ find_dependent_phvs(PlannerInfo *root, int varno)
 		return false;
 
 	context.relids = bms_make_singleton(varno);
+	context.baserels = baserels;
 	context.sublevels_up = 0;
 
 	if (query_tree_walker(root->parse, find_dependent_phvs_walker, &context, 0))
@@ -4354,7 +4536,8 @@ find_dependent_phvs(PlannerInfo *root, int varno)
 }
 
 static bool
-find_dependent_phvs_in_jointree(PlannerInfo *root, Node *node, int varno)
+find_dependent_phvs_in_jointree(PlannerInfo *root, Node *node, int varno,
+								Relids baserels)
 {
 	find_dependent_phvs_context context;
 	Relids		subrelids;
@@ -4365,6 +4548,7 @@ find_dependent_phvs_in_jointree(PlannerInfo *root, Node *node, int varno)
 		return false;
 
 	context.relids = bms_make_singleton(varno);
+	context.baserels = baserels;
 	context.sublevels_up = 0;
 
 	/*

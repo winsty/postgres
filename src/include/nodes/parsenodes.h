@@ -109,10 +109,13 @@ typedef uint64 AclMode;			/* a bitmask of privilege bits */
  *	  Planning converts a Query tree into a Plan tree headed by a PlannedStmt
  *	  node --- the Query structure is not used by the executor.
  *
- *	  All the fields ignored for the query jumbling are not semantically
- *	  significant (such as alias names), as is ignored anything that can
- *	  be deduced from child nodes (else we'd just be double-hashing that
- *	  piece of information).
+ *	  We ignore fields for query jumbling if they are not semantically
+ *	  significant (such as alias names).  We also ignore anything that can
+ *	  be deduced from other fields or child nodes, else we'd just be
+ *	  double-hashing that piece of information.  In some places query jumbling
+ *	  deliberately ignores fields that are semantically significant, such as
+ *	  Const values, because we have made a policy decision to combine queries
+ *	  that differ only in those respects.
  */
 typedef struct Query
 {
@@ -125,8 +128,8 @@ typedef struct Query
 
 	/*
 	 * query identifier (can be set by plugins); ignored for equal, as it
-	 * might not be set; also not stored.  This is the result of the query
-	 * jumble, hence ignored.
+	 * might not be set; also not stored.  This is the output of query
+	 * jumbling, hence it must be ignored as an input.
 	 *
 	 * We store this as a signed value as this is the form it's displayed to
 	 * users in places such as EXPLAIN and pg_stat_statements.  Primarily this
@@ -142,8 +145,7 @@ typedef struct Query
 
 	/*
 	 * rtable index of target relation for INSERT/UPDATE/DELETE/MERGE; 0 for
-	 * SELECT.  This is ignored in the query jumble as unrelated to the
-	 * compilation of the query ID.
+	 * SELECT.
 	 */
 	int			resultRelation pg_node_attr(query_jumble_ignore);
 
@@ -218,7 +220,6 @@ typedef struct Query
 
 	List	   *groupClause;	/* a list of SortGroupClause's */
 	bool		groupDistinct;	/* was GROUP BY DISTINCT used? */
-	bool		groupByAll;		/* was GROUP BY ALL used? */
 
 	List	   *groupingSets;	/* a list of GroupingSet's if present */
 
@@ -819,7 +820,8 @@ typedef enum TableLikeOption
  *
  * For a plain index attribute, 'name' is the name of the table column to
  * index, and 'expr' is NULL.  For an index expression, 'name' is NULL and
- * 'expr' is the expression tree.
+ * 'expr' is the expression tree.  indexcolname is currently used only to
+ * force column name choices when cloning an index.
  */
 typedef struct IndexElem
 {
@@ -983,39 +985,13 @@ typedef struct PartitionRangeDatum
 } PartitionRangeDatum;
 
 /*
- * PartitionDesc - info about a single partition for the ALTER TABLE SPLIT
- *	  PARTITION command
- */
-typedef struct SinglePartitionSpec
-{
-	NodeTag		type;
-
-	RangeVar   *name;			/* name of partition */
-	PartitionBoundSpec *bound;	/* FOR VALUES, if attaching */
-} SinglePartitionSpec;
-
-/*
- * PartitionCmd - info for ALTER TABLE/INDEX ATTACH/DETACH PARTITION and for
- *	  ALTER TABLE SPLIT/MERGE PARTITION(S) commands
+ * PartitionCmd - info for ALTER TABLE/INDEX ATTACH/DETACH PARTITION commands
  */
 typedef struct PartitionCmd
 {
 	NodeTag		type;
-
-	/* name of partition to attach/detach/merge/split */
-	RangeVar   *name;
-
-	/* FOR VALUES, if attaching */
-	PartitionBoundSpec *bound;
-
-	/*
-	 * list of partitions to be split/merged, used in ALTER TABLE MERGE
-	 * PARTITIONS and ALTER TABLE SPLIT PARTITIONS. For merge partitions,
-	 * partlist is a list of RangeVar; For split partition, it is a list of
-	 * SinglePartitionSpec.
-	 */
-	List	   *partlist;
-
+	RangeVar   *name;			/* name of partition to attach/detach */
+	PartitionBoundSpec *bound;	/* FOR VALUES, if attaching */
 	bool		concurrent;
 } PartitionCmd;
 
@@ -1427,8 +1403,6 @@ typedef struct RTEPermissionInfo
  * time.  We do however remember how many columns we thought the type had
  * (including dropped columns!), so that we can successfully ignore any
  * columns added after the query was parsed.
- *
- * The query jumbling only needs to track the function expression.
  */
 typedef struct RangeTblFunction
 {
@@ -1647,9 +1621,6 @@ typedef struct GroupingSet
  * When refname isn't null, the partitionClause is always copied from there;
  * the orderClause might or might not be copied (see copiedOrder); the framing
  * options are never copied, per spec.
- *
- * The information relevant for the query jumbling is the partition clause
- * type and its bounds.
  */
 typedef struct WindowClause
 {
@@ -1823,7 +1794,7 @@ typedef struct CommonTableExpr
 
 	/*
 	 * Number of RTEs referencing this CTE (excluding internal
-	 * self-references), irrelevant for query jumbling.
+	 * self-references).
 	 */
 	int			cterefcount pg_node_attr(query_jumble_ignore);
 	/* list of output column names */
@@ -1985,6 +1956,48 @@ typedef struct JsonTablePathSpec
 } JsonTablePathSpec;
 
 /*
+ * JsonTablePlanType -
+ *		flags for JSON_TABLE plan node types representation
+ */
+typedef enum JsonTablePlanType
+{
+	JSTP_DEFAULT,
+	JSTP_SIMPLE,
+	JSTP_JOINED,
+} JsonTablePlanType;
+
+/*
+ * JsonTablePlanJoinType -
+ *		JSON_TABLE join types for JSTP_JOINED plans
+ */
+typedef enum JsonTablePlanJoinType
+{
+	JSTP_JOIN_INNER = 0x01,
+	JSTP_JOIN_OUTER = 0x02,
+	JSTP_JOIN_CROSS = 0x04,
+	JSTP_JOIN_UNION = 0x08,
+} JsonTablePlanJoinType;
+
+/*
+ * JsonTablePlanSpec -
+ *		untransformed representation of JSON_TABLE's PLAN clause
+ */
+typedef struct JsonTablePlanSpec
+{
+	NodeTag		type;
+
+	JsonTablePlanType plan_type;	/* plan type */
+	JsonTablePlanJoinType join_type;	/* join type (for joined plan only) */
+	char	   *pathname;		/* path name (for simple plan only) */
+
+	/* For joined plans */
+	struct JsonTablePlanSpec *plan1;	/* first joined plan */
+	struct JsonTablePlanSpec *plan2;	/* second joined plan */
+
+	ParseLoc	location;		/* token location, or -1 if unknown */
+} JsonTablePlanSpec;
+
+/*
  * JsonTable -
  *		untransformed representation of JSON_TABLE
  */
@@ -1995,6 +2008,7 @@ typedef struct JsonTable
 	JsonTablePathSpec *pathspec;	/* JSON path specification */
 	List	   *passing;		/* list of PASSING clause arguments, if any */
 	List	   *columns;		/* list of JsonTableColumn */
+	JsonTablePlanSpec *planspec;	/* join plan, if specified */
 	JsonBehavior *on_error;		/* ON ERROR behavior */
 	Alias	   *alias;			/* table alias in FROM clause */
 	bool		lateral;		/* does it have LATERAL prefix? */
@@ -2300,7 +2314,6 @@ typedef struct SelectStmt
 	Node	   *whereClause;	/* WHERE qualification */
 	List	   *groupClause;	/* GROUP BY clauses */
 	bool		groupDistinct;	/* Is this GROUP BY DISTINCT? */
-	bool		groupByAll;		/* Is this GROUP BY ALL? */
 	Node	   *havingClause;	/* HAVING conditional-expression */
 	List	   *windowClause;	/* WINDOW window_name AS (...), ... */
 
@@ -2364,7 +2377,7 @@ typedef struct SetOperationStmt
 	Node	   *rarg;			/* right child */
 	/* Eventually add fields for CORRESPONDING spec here */
 
-	/* Fields derived during parse analysis (irrelevant for query jumbling): */
+	/* Fields derived during parse analysis: */
 	/* OID list of output column type OIDs */
 	List	   *colTypes pg_node_attr(query_jumble_ignore);
 	/* integer list of output column typmods */
@@ -2583,8 +2596,6 @@ typedef enum AlterTableType
 	AT_AttachPartition,			/* ATTACH PARTITION */
 	AT_DetachPartition,			/* DETACH PARTITION */
 	AT_DetachPartitionFinalize, /* DETACH PARTITION FINALIZE */
-	AT_SplitPartition,			/* SPLIT PARTITION */
-	AT_MergePartitions,			/* MERGE PARTITIONS */
 	AT_AddIdentity,				/* ADD IDENTITY */
 	AT_SetIdentity,				/* SET identity column options */
 	AT_DropIdentity,			/* DROP IDENTITY */
@@ -3635,6 +3646,7 @@ typedef struct CreateStatsStmt
 	char	   *stxcomment;		/* comment to apply to stats, or NULL */
 	bool		transformed;	/* true when transformStatsStmt is finished */
 	bool		if_not_exists;	/* do nothing if stats name already exists */
+	Oid			owner;			/* OID of owner, or InvalidOid for default */
 } CreateStatsStmt;
 
 /*
@@ -3740,8 +3752,6 @@ typedef struct InlineCodeBlock
  * list contains copies of the expressions for all output arguments, in the
  * order of the procedure's declared arguments.  (outargs is never evaluated,
  * but is useful to the caller as a reference for what to assign to.)
- * The transformed call state is not relevant in the query jumbling, only the
- * function call is.
  * ----------------------
  */
 typedef struct CallStmt

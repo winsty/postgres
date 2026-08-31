@@ -512,6 +512,8 @@ static void get_json_agg_constructor(JsonConstructorExpr *ctor,
 									 deparse_context *context,
 									 const char *funcname,
 									 bool is_json_objectagg);
+static void get_json_agg_constructor_expr(Node *node, deparse_context *context,
+										  void *callback_arg);
 static void simple_quote_literal(StringInfo buf, const char *val);
 static void get_sublink_expr(SubLink *sublink, deparse_context *context);
 static void get_tablefunc(TableFunc *tf, deparse_context *context,
@@ -525,6 +527,7 @@ static void get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
 static void get_column_alias_list(deparse_columns *colinfo,
 								  deparse_context *context);
 static void get_for_portion_of(ForPortionOfExpr *forPortionOf,
+							   RangeTblEntry *rte,
 							   deparse_context *context);
 static void get_from_clause_coldeflist(RangeTblFunction *rtfunc,
 									   deparse_columns *colinfo,
@@ -2928,7 +2931,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				deconstruct_array_builtin(DatumGetArrayTypeP(val), OIDOID,
 										  &elems, NULL, &nElems);
 
-				operators = (Oid *) palloc(nElems * sizeof(Oid));
+				operators = palloc_array(Oid, nElems);
 				for (i = 0; i < nElems; i++)
 					operators[i] = DatumGetObjectId(elems[i]);
 
@@ -4129,8 +4132,7 @@ deparse_context_for_plan_tree(PlannedStmt *pstmt, List *rtable_names)
 		int			ntables = list_length(dpns->rtable);
 		ListCell   *lc;
 
-		dpns->appendrels = (AppendRelInfo **)
-			palloc0((ntables + 1) * sizeof(AppendRelInfo *));
+		dpns->appendrels = palloc0_array(AppendRelInfo *, ntables + 1);
 		foreach(lc, pstmt->appendRelations)
 		{
 			AppendRelInfo *appinfo = lfirst_node(AppendRelInfo, lc);
@@ -4410,7 +4412,7 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
 	dpns->rtable_columns = NIL;
 	while (list_length(dpns->rtable_columns) < list_length(dpns->rtable))
 		dpns->rtable_columns = lappend(dpns->rtable_columns,
-									   palloc0(sizeof(deparse_columns)));
+									   palloc0_object(deparse_columns));
 
 	/* If it's a utility query, it won't have a jointree */
 	if (query->jointree)
@@ -4466,7 +4468,7 @@ set_simple_column_names(deparse_namespace *dpns)
 	dpns->rtable_columns = NIL;
 	while (list_length(dpns->rtable_columns) < list_length(dpns->rtable))
 		dpns->rtable_columns = lappend(dpns->rtable_columns,
-									   palloc0(sizeof(deparse_columns)));
+									   palloc0_object(deparse_columns));
 
 	/* Assign unique column aliases within each non-join RTE */
 	forboth(lc, dpns->rtable, lc2, dpns->rtable_columns)
@@ -4759,7 +4761,7 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 		tupdesc = RelationGetDescr(rel);
 
 		ncolumns = tupdesc->natts;
-		real_colnames = (char **) palloc(ncolumns * sizeof(char *));
+		real_colnames = palloc_array(char *, ncolumns);
 
 		for (i = 0; i < ncolumns; i++)
 		{
@@ -4803,7 +4805,7 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 			colnames = rte->eref->colnames;
 
 		ncolumns = list_length(colnames);
-		real_colnames = (char **) palloc(ncolumns * sizeof(char *));
+		real_colnames = palloc_array(char *, ncolumns);
 
 		i = 0;
 		foreach(lc, colnames)
@@ -4839,8 +4841,8 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 	 * colname_is_unique will not consult that array, which is fine because it
 	 * would only be duplicate effort.
 	 */
-	colinfo->new_colnames = (char **) palloc(ncolumns * sizeof(char *));
-	colinfo->is_new_col = (bool *) palloc(ncolumns * sizeof(bool));
+	colinfo->new_colnames = palloc_array(char *, ncolumns);
+	colinfo->is_new_col = palloc_array(bool, ncolumns);
 
 	/* If the RTE is wide enough, use a hash table to avoid O(N^2) costs */
 	build_colinfo_names_hash(colinfo);
@@ -5042,8 +5044,8 @@ set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 	nnewcolumns = leftcolinfo->num_new_cols + rightcolinfo->num_new_cols -
 		list_length(colinfo->usingNames);
 	colinfo->num_new_cols = nnewcolumns;
-	colinfo->new_colnames = (char **) palloc0(nnewcolumns * sizeof(char *));
-	colinfo->is_new_col = (bool *) palloc0(nnewcolumns * sizeof(bool));
+	colinfo->new_colnames = palloc0_array(char *, nnewcolumns);
+	colinfo->is_new_col = palloc0_array(bool, nnewcolumns);
 
 	/*
 	 * Generating the new_colnames array is a bit tricky since any new columns
@@ -5455,8 +5457,8 @@ identify_join_columns(JoinExpr *j, RangeTblEntry *jrte,
 	/* Initialize result arrays with zeroes */
 	numjoincols = list_length(jrte->joinaliasvars);
 	Assert(numjoincols == list_length(jrte->eref->colnames));
-	colinfo->leftattnos = (int *) palloc0(numjoincols * sizeof(int));
-	colinfo->rightattnos = (int *) palloc0(numjoincols * sizeof(int));
+	colinfo->leftattnos = palloc0_array(int, numjoincols);
+	colinfo->rightattnos = palloc0_array(int, numjoincols);
 
 	/*
 	 * Deconstruct RTE's joinleftcols/joinrightcols into desired format.
@@ -6553,9 +6555,7 @@ get_basic_select_query(Query *query, deparse_context *context)
 		save_ingroupby = context->inGroupBy;
 		context->inGroupBy = true;
 
-		if (query->groupByAll)
-			appendStringInfoString(buf, "ALL");
-		else if (query->groupingSets == NIL)
+		if (query->groupingSets == NIL)
 		{
 			sep = "";
 			foreach(l, query->groupClause)
@@ -7556,7 +7556,7 @@ get_update_query_def(Query *query, deparse_context *context)
 					 generate_relation_name(rte->relid, NIL));
 
 	/* Print the FOR PORTION OF, if needed */
-	get_for_portion_of(query->forPortionOf, context);
+	get_for_portion_of(query->forPortionOf, rte, context);
 
 	/* Print the relation alias, if needed */
 	get_rte_alias(rte, query->resultRelation, false, context);
@@ -7763,7 +7763,7 @@ get_delete_query_def(Query *query, deparse_context *context)
 					 generate_relation_name(rte->relid, NIL));
 
 	/* Print the FOR PORTION OF, if needed */
-	get_for_portion_of(query->forPortionOf, context);
+	get_for_portion_of(query->forPortionOf, rte, context);
 
 	/* Print the relation alias, if needed */
 	get_rte_alias(rte, query->resultRelation, false, context);
@@ -8134,7 +8134,7 @@ get_graph_pattern_def(GraphPattern *graph_pattern, deparse_context *context)
 
 	if (graph_pattern->whereClause)
 	{
-		appendStringInfoString(buf, "WHERE ");
+		appendStringInfoString(buf, " WHERE ");
 		get_rule_expr(graph_pattern->whereClause, context, false);
 	}
 }
@@ -11811,7 +11811,7 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
 				Assert(IsA(con, Const) &&
 					   con->consttype == TEXTOID &&
 					   !con->constisnull);
-				appendStringInfoString(buf, TextDatumGetCString(con->constvalue));
+				appendStringInfoString(buf, quote_identifier(TextDatumGetCString(con->constvalue)));
 			}
 			appendStringInfoString(buf, " FROM ");
 			get_rule_expr((Node *) lsecond(expr->args), context, false);
@@ -11831,6 +11831,7 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
 				Assert(IsA(con, Const) &&
 					   con->consttype == TEXTOID &&
 					   !con->constisnull);
+				/* NB: safe because no allowed words need quoted/escaped */
 				appendStringInfo(buf, " %s",
 								 TextDatumGetCString(con->constvalue));
 			}
@@ -12291,6 +12292,7 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 					  context->prettyFlags, context->wrapColumn,
 					  context->indentLevel);
 
+		get_json_format(ctor->format, buf);
 		get_json_constructor_options(ctor, buf);
 		appendStringInfoChar(buf, ')');
 
@@ -12389,9 +12391,39 @@ get_json_agg_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 		get_windowfunc_expr_helper((WindowFunc *) ctor->func, context,
 								   funcname, options.data,
 								   is_json_objectagg);
+	else if (IsA(ctor->func, Var))
+	{
+		/*
+		 * If the aggregate is computed by a lower plan node, setrefs.c will
+		 * have replaced the Aggref or WindowFunc with a Var referencing that
+		 * node's output.  Chase the Var back to it so we can still print the
+		 * original JSON aggregate syntax.  This only happens in EXPLAIN.
+		 */
+		resolve_special_varno((Node *) ctor->func, context,
+							  get_json_agg_constructor_expr, ctor);
+	}
 	else
 		elog(ERROR, "invalid JsonConstructorExpr underlying node type: %d",
 			 nodeTag(ctor->func));
+}
+
+/*
+ * Deparse a JsonConstructorExpr whose aggregate is computed by a lower plan
+ * node; resolve_special_varno has located the underlying Aggref/WindowFunc.
+ */
+static void
+get_json_agg_constructor_expr(Node *node, deparse_context *context,
+							  void *callback_arg)
+{
+	JsonConstructorExpr ctor;
+
+	if (!IsA(node, Aggref) && !IsA(node, WindowFunc))
+		elog(ERROR, "JSON aggregate constructor does not point to an Aggref or WindowFunc");
+
+	/* Flat copy suffices; we only replace func. */
+	ctor = *(JsonConstructorExpr *) callback_arg;
+	ctor.func = (Expr *) node;
+	get_json_constructor(&ctor, context, false);
 }
 
 /*
@@ -12676,6 +12708,90 @@ get_json_table_nested_columns(TableFunc *tf, JsonTablePlan *plan,
 }
 
 /*
+ * json_table_plan_is_default - does this plan match the implicit default?
+ *
+ * When no PLAN clause is given, JSON_TABLE builds a default plan that joins
+ * every nested path to its parent with OUTER and every set of sibling paths
+ * with UNION (see transformJsonTableColumns()).  Such a plan is fully implied
+ * by the NESTED COLUMNS structure, so we need not (and, to match the input,
+ * should not) print a PLAN clause for it; we only deparse a PLAN clause when
+ * the plan deviates from the default, i.e. uses an INNER or CROSS join
+ * somewhere.  This follows the usual ruleutils convention of omitting a clause
+ * that merely restates the default (cf. get_json_expr_options() for ON
+ * EMPTY/ON ERROR, or the NULLS FIRST/LAST handling in get_rule_orderby()).
+ */
+static bool
+json_table_plan_is_default(JsonTablePlan *plan)
+{
+	if (IsA(plan, JsonTablePathScan))
+	{
+		JsonTablePathScan *scan = castNode(JsonTablePathScan, plan);
+
+		if (scan->child)
+		{
+			if (!scan->outerJoin)
+				return false;	/* INNER is not the default */
+			return json_table_plan_is_default(scan->child);
+		}
+
+		return true;
+	}
+	else
+	{
+		JsonTableSiblingJoin *join = castNode(JsonTableSiblingJoin, plan);
+
+		if (join->cross)
+			return false;		/* CROSS is not the default */
+		return json_table_plan_is_default(join->lplan) &&
+			json_table_plan_is_default(join->rplan);
+	}
+}
+
+/*
+ * get_json_table_plan - Parse back a JSON_TABLE plan
+ */
+static void
+get_json_table_plan(TableFunc *tf, JsonTablePlan *plan, deparse_context *context,
+					bool parenthesize)
+{
+	if (parenthesize)
+		appendStringInfoChar(context->buf, '(');
+
+	if (IsA(plan, JsonTablePathScan))
+	{
+		JsonTablePathScan *s = castNode(JsonTablePathScan, plan);
+
+		appendStringInfoString(context->buf, quote_identifier(s->path->name));
+
+		if (s->child)
+		{
+			appendStringInfoString(context->buf,
+								   s->outerJoin ? " OUTER " : " INNER ");
+			get_json_table_plan(tf, s->child, context,
+								IsA(s->child, JsonTableSiblingJoin) ||
+								castNode(JsonTablePathScan, s->child)->child);
+		}
+	}
+	else if (IsA(plan, JsonTableSiblingJoin))
+	{
+		JsonTableSiblingJoin *j = (JsonTableSiblingJoin *) plan;
+
+		get_json_table_plan(tf, j->lplan, context,
+							IsA(j->lplan, JsonTableSiblingJoin) ||
+							castNode(JsonTablePathScan, j->lplan)->child);
+
+		appendStringInfoString(context->buf, j->cross ? " CROSS " : " UNION ");
+
+		get_json_table_plan(tf, j->rplan, context,
+							IsA(j->rplan, JsonTableSiblingJoin) ||
+							castNode(JsonTablePathScan, j->rplan)->child);
+	}
+
+	if (parenthesize)
+		appendStringInfoChar(context->buf, ')');
+}
+
+/*
  * get_json_table_columns - Parse back JSON_TABLE columns
  */
 static void
@@ -12839,6 +12955,18 @@ get_json_table(TableFunc *tf, deparse_context *context, bool showimplicit)
 
 	get_json_table_columns(tf, castNode(JsonTablePathScan, tf->plan), context,
 						   showimplicit);
+
+	/*
+	 * Deparse a PLAN clause only for a non-default plan; the default plan is
+	 * implied by the NESTED COLUMNS structure (see
+	 * json_table_plan_is_default).
+	 */
+	if (root->child && !json_table_plan_is_default((JsonTablePlan *) root))
+	{
+		appendStringInfoChar(buf, ' ');
+		appendContextKeyword(context, "PLAN ", 0, 0, 0);
+		get_json_table_plan(tf, (JsonTablePlan *) root, context, true);
+	}
 
 	if (jexpr->on_error->btype != JSON_BEHAVIOR_EMPTY_ARRAY)
 		get_json_behavior(jexpr->on_error, context, "ERROR");
@@ -13352,12 +13480,18 @@ get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
  * alias and SET will be on their own line with a leading space.
  */
 static void
-get_for_portion_of(ForPortionOfExpr *forPortionOf, deparse_context *context)
+get_for_portion_of(ForPortionOfExpr *forPortionOf, RangeTblEntry *rte,
+				   deparse_context *context)
 {
 	if (forPortionOf)
 	{
+		char	   *range_name;
+
+		range_name = get_attname(rte->relid,
+								 forPortionOf->rangeVar->varattno,
+								 false);
 		appendStringInfo(context->buf, " FOR PORTION OF %s",
-						 quote_identifier(forPortionOf->range_name));
+						 quote_identifier(range_name));
 
 		/*
 		 * Try to write it as FROM ... TO ... if we received it that way,

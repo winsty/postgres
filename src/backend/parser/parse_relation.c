@@ -509,6 +509,9 @@ check_lateral_ref_ok(ParseState *pstate, ParseNamespaceItem *nsitem,
 /*
  * Given an RT index and nesting depth, find the corresponding
  * ParseNamespaceItem (there must be one).
+ *
+ * NB: Callers starting from a Var should consider using GetNSItemByVar()
+ * instead, to find the namespace item with matching varreturningtype.
  */
 ParseNamespaceItem *
 GetNSItemByRangeTablePosn(ParseState *pstate,
@@ -527,6 +530,35 @@ GetNSItemByRangeTablePosn(ParseState *pstate,
 		ParseNamespaceItem *nsitem = (ParseNamespaceItem *) lfirst(lc);
 
 		if (nsitem->p_rtindex == varno)
+			return nsitem;
+	}
+	elog(ERROR, "nsitem not found (internal error)");
+	return NULL;				/* keep compiler quiet */
+}
+
+/*
+ * Given a Var, find the corresponding ParseNamespaceItem (there must be one).
+ *
+ * Like GetNSItemByRangeTablePosn(), but uses the Var's varreturningtype in
+ * addition to its varno and varlevelsup to find the namespace item.
+ */
+ParseNamespaceItem *
+GetNSItemByVar(ParseState *pstate, Var *var)
+{
+	int			sublevels_up = var->varlevelsup;
+	ListCell   *lc;
+
+	while (sublevels_up-- > 0)
+	{
+		pstate = pstate->parentParseState;
+		Assert(pstate != NULL);
+	}
+	foreach(lc, pstate->p_namespace)
+	{
+		ParseNamespaceItem *nsitem = (ParseNamespaceItem *) lfirst(lc);
+
+		if (nsitem->p_rtindex == var->varno &&
+			nsitem->p_returning_type == var->varreturningtype)
 			return nsitem;
 	}
 	elog(ERROR, "nsitem not found (internal error)");
@@ -1049,7 +1081,7 @@ markNullableIfNeeded(ParseState *pstate, Var *var)
 	Bitmapset  *relids;
 
 	/* Find the appropriate pstate */
-	for (int lv = 0; lv < var->varlevelsup; lv++)
+	for (Index lv = 0; lv < var->varlevelsup; lv++)
 		pstate = pstate->parentParseState;
 
 	/* Find currently-relevant join relids for the Var's rel */
@@ -1315,8 +1347,7 @@ buildNSItemFromTupleDesc(RangeTblEntry *rte, Index rtindex,
 	Assert(maxattrs == list_length(rte->eref->colnames));
 
 	/* extract per-column data from the tupdesc */
-	nscolumns = (ParseNamespaceColumn *)
-		palloc0(maxattrs * sizeof(ParseNamespaceColumn));
+	nscolumns = palloc0_array(ParseNamespaceColumn, maxattrs);
 
 	for (varattno = 0; varattno < maxattrs; varattno++)
 	{
@@ -1381,8 +1412,7 @@ buildNSItemFromLists(RangeTblEntry *rte, Index rtindex,
 	Assert(maxattrs == list_length(colcollations));
 
 	/* extract per-column data from the lists */
-	nscolumns = (ParseNamespaceColumn *)
-		palloc0(maxattrs * sizeof(ParseNamespaceColumn));
+	nscolumns = palloc0_array(ParseNamespaceColumn, maxattrs);
 
 	varattno = 0;
 	forthree(lct, coltypes,

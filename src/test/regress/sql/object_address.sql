@@ -47,6 +47,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE regress_addr_user REVOKE DELETE ON TABLES FROM
 CREATE TRANSFORM FOR int LANGUAGE SQL (
     FROM SQL WITH FUNCTION prsd_lextype(internal),
     TO SQL WITH FUNCTION int4recv(internal));
+-- make a function that uses it too, mainly to exercise pg_dump
+CREATE FUNCTION public.sql_func_with_transform(int) RETURNS int LANGUAGE sql
+AS 'select $1 + 1'
+TRANSFORM FOR TYPE int;
 -- suppress warning that depends on wal_level
 SET client_min_messages = 'ERROR';
 CREATE PUBLICATION addr_pub FOR TABLE addr_nsp.gentable;
@@ -67,7 +71,8 @@ DECLARE
 BEGIN
     FOR objtype IN VALUES ('toast table'), ('index column'), ('sequence column'),
         ('toast table column'), ('view column'), ('materialized view column'),
-        ('property graph element'), ('property graph label'), ('property graph property')
+        ('property graph element'), ('property graph label'), ('property graph property'),
+        ('property graph element label'), ('property graph label property')
     LOOP
         BEGIN
             PERFORM pg_get_object_address(objtype, '{one}', '{}');
@@ -284,6 +289,8 @@ WITH objects (classid, objid, objsubid) AS (VALUES
     ('pg_propgraph_element'::regclass, 0, 0), -- no property graph element
     ('pg_propgraph_label'::regclass, 0, 0), -- no property graph label
     ('pg_propgraph_property'::regclass, 0, 0), -- no property graph property
+    ('pg_propgraph_element_label'::regclass, 0, 0), -- no property graph element label
+    ('pg_propgraph_label_property'::regclass, 0, 0), -- no property graph label property
     ('pg_publication'::regclass, 0, 0), -- no publication
     ('pg_publication_namespace'::regclass, 0, 0), -- no publication namespace
     ('pg_publication_rel'::regclass, 0, 0), -- no publication relation

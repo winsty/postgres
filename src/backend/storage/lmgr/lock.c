@@ -312,7 +312,7 @@ typedef struct
 	uint32		count[FAST_PATH_STRONG_LOCK_HASH_PARTITIONS];
 } FastPathStrongRelationLockData;
 
-static volatile FastPathStrongRelationLockData *FastPathStrongRelationLocks;
+static FastPathStrongRelationLockData *FastPathStrongRelationLocks;
 
 static void LockManagerShmemRequest(void *arg);
 static void LockManagerShmemInit(void *arg);
@@ -913,13 +913,23 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	else
 	{
 		/* Make sure there will be room to remember the lock */
-		if (locallock->numLockOwners >= locallock->maxLockOwners)
+		if (locallock->lockOwners == NULL)
+		{
+			/*
+			 * A prior acquisition may leave the array unallocated after an
+			 * out-of-memory failure.
+			 */
+			locallock->maxLockOwners = 8;
+			locallock->lockOwners = (LOCALLOCKOWNER *)
+				MemoryContextAlloc(TopMemoryContext,
+								   locallock->maxLockOwners * sizeof(LOCALLOCKOWNER));
+		}
+		else if (locallock->numLockOwners >= locallock->maxLockOwners)
 		{
 			int			newsize = locallock->maxLockOwners * 2;
 
-			locallock->lockOwners = (LOCALLOCKOWNER *)
-				repalloc(locallock->lockOwners,
-						 newsize * sizeof(LOCALLOCKOWNER));
+			locallock->lockOwners = repalloc_array(locallock->lockOwners,
+												   LOCALLOCKOWNER, newsize);
 			locallock->maxLockOwners = newsize;
 		}
 	}
@@ -3122,7 +3132,6 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 	 */
 	if (ConflictsWithRelationFastPath(locktag, lockmode))
 	{
-		int			i;
 		Oid			relid = locktag->locktag_field2;
 		VirtualTransactionId vxid;
 
@@ -3139,7 +3148,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 		 * time we return the value and the time the caller does something
 		 * with it.
 		 */
-		for (i = 0; i < ProcGlobal->allProcCount; i++)
+		for (uint32 i = 0; i < ProcGlobal->allProcCount; i++)
 		{
 			PGPROC	   *proc = GetPGProcByNumber(i);
 			uint32		j;
@@ -3780,7 +3789,6 @@ GetLockStatusData(void)
 	HASH_SEQ_STATUS seqstat;
 	int			els;
 	int			el;
-	int			i;
 
 	data = palloc_object(LockData);
 
@@ -3801,7 +3809,7 @@ GetLockStatusData(void)
 	 * lockGroupLeader field without holding all lock partition locks, and
 	 * it's not worth that.)
 	 */
-	for (i = 0; i < ProcGlobal->allProcCount; ++i)
+	for (uint32 i = 0; i < ProcGlobal->allProcCount; ++i)
 	{
 		PGPROC	   *proc = GetPGProcByNumber(i);
 
@@ -3830,8 +3838,7 @@ GetLockStatusData(void)
 				if (el >= els)
 				{
 					els += MaxBackends;
-					data->locks = (LockInstanceData *)
-						repalloc(data->locks, sizeof(LockInstanceData) * els);
+					data->locks = repalloc_array(data->locks, LockInstanceData, els);
 				}
 
 				instance = &data->locks[el];
@@ -3863,8 +3870,7 @@ GetLockStatusData(void)
 			if (el >= els)
 			{
 				els += MaxBackends;
-				data->locks = (LockInstanceData *)
-					repalloc(data->locks, sizeof(LockInstanceData) * els);
+				data->locks = repalloc_array(data->locks, LockInstanceData, els);
 			}
 
 			vxid.procNumber = proc->vxid.procNumber;
@@ -3900,7 +3906,7 @@ GetLockStatusData(void)
 	 *
 	 * Must grab LWLocks in partition-number order to avoid LWLock deadlock.
 	 */
-	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+	for (int i = 0; i < NUM_LOCK_PARTITIONS; i++)
 		LWLockAcquire(LockHashPartitionLockByIndex(i), LW_SHARED);
 
 	/* Now we can safely count the number of proclocks */
@@ -3908,8 +3914,7 @@ GetLockStatusData(void)
 	if (data->nelements > els)
 	{
 		els = data->nelements;
-		data->locks = (LockInstanceData *)
-			repalloc(data->locks, sizeof(LockInstanceData) * els);
+		data->locks = repalloc_array(data->locks, LockInstanceData, els);
 	}
 
 	/* Now scan the tables to copy the data */
@@ -3944,7 +3949,7 @@ GetLockStatusData(void)
 	 * until it can get all the locks it needs. (2) This avoids O(N^2)
 	 * behavior inside LWLockRelease.
 	 */
-	for (i = NUM_LOCK_PARTITIONS; --i >= 0;)
+	for (int i = NUM_LOCK_PARTITIONS; --i >= 0;)
 		LWLockRelease(LockHashPartitionLockByIndex(i));
 
 	Assert(el == data->nelements);
@@ -4092,8 +4097,7 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
 		if (data->nlocks >= data->maxlocks)
 		{
 			data->maxlocks += MaxBackends;
-			data->locks = (LockInstanceData *)
-				repalloc(data->locks, sizeof(LockInstanceData) * data->maxlocks);
+			data->locks = repalloc_array(data->locks, LockInstanceData, data->maxlocks);
 		}
 
 		instance = &data->locks[data->nlocks];
@@ -4119,8 +4123,7 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
 	{
 		data->maxpids = Max(data->maxpids + MaxBackends,
 							data->npids + queue_size);
-		data->waiter_pids = (int *) repalloc(data->waiter_pids,
-											 sizeof(int) * data->maxpids);
+		data->waiter_pids = repalloc_array(data->waiter_pids, int, data->maxpids);
 	}
 
 	/* Collect PIDs from the lock's wait queue, stopping at blocked_proc */
@@ -4174,7 +4177,7 @@ GetRunningTransactionLocks(int *nlocks)
 	 * Allocating enough space for all locks in the lock table is overkill,
 	 * but it's more convenient and faster than having to enlarge the array.
 	 */
-	accessExclusiveLocks = palloc(els * sizeof(xl_standby_lock));
+	accessExclusiveLocks = palloc_array(xl_standby_lock, els);
 
 	/* Now scan the tables to copy the data */
 	hash_seq_init(&seqstat, LockMethodProcLockHash);

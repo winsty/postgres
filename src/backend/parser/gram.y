@@ -120,7 +120,6 @@ typedef struct SelectLimit
 typedef struct GroupClause
 {
 	bool		distinct;
-	bool		all;
 	List	   *list;
 } GroupClause;
 
@@ -263,7 +262,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	PartitionElem *partelem;
 	PartitionSpec *partspec;
 	PartitionBoundSpec *partboundspec;
-	SinglePartitionSpec *singlepartspec;
 	RoleSpec   *rolespec;
 	PublicationObjSpec *publicationobjectspec;
 	PublicationAllObjSpec *publicationallobjectspec;
@@ -655,8 +653,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <partelem>	part_elem
 %type <list>		part_params
 %type <partboundspec> PartitionBoundSpec
-%type <singlepartspec>	SinglePartitionSpec
-%type <list>		partitions_list
 %type <list>		hash_partbound
 %type <defelt>		hash_partbound_elem
 
@@ -672,6 +668,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				json_table
 				json_table_column_definition
 				json_table_column_path_clause_opt
+				json_table_plan_clause_opt
+				json_table_plan
+				json_table_plan_simple
+				json_table_plan_outer
+				json_table_plan_inner
+				json_table_plan_union
+				json_table_plan_cross
+				json_table_plan_primary
 %type <list>	json_name_and_value_list
 				json_value_expr_list
 				json_array_aggregate_order_by_clause_opt
@@ -683,6 +687,9 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <ival>	json_behavior_type
 				json_predicate_type_constraint
 				json_quotes_clause_opt
+				json_table_default_plan_choices
+				json_table_default_plan_inner_outer
+				json_table_default_plan_union_cross
 				json_wrapper_behavior
 %type <boolean>	json_key_uniqueness_constraint_opt
 				json_object_constructor_null_clause_opt
@@ -801,7 +808,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
-	PARALLEL PARAMETER PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PATH
+	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
 	PERIOD PLACING PLAN PLANS POLICY PORTION
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PROPERTIES PROPERTY PUBLICATION
@@ -816,7 +823,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
-	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPLIT SOURCE SQL_P STABLE STANDALONE_P
+	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
@@ -2437,23 +2444,6 @@ alter_table_cmds:
 			| alter_table_cmds ',' alter_table_cmd	{ $$ = lappend($1, $3); }
 		;
 
-partitions_list:
-			SinglePartitionSpec							{ $$ = list_make1($1); }
-			| partitions_list ',' SinglePartitionSpec	{ $$ = lappend($1, $3); }
-		;
-
-SinglePartitionSpec:
-			PARTITION qualified_name PartitionBoundSpec
-				{
-					SinglePartitionSpec *n = makeNode(SinglePartitionSpec);
-
-					n->name = $2;
-					n->bound = $3;
-
-					$$ = n;
-				}
-		;
-
 partition_cmd:
 			/* ALTER TABLE <name> ATTACH PARTITION <table_name> FOR VALUES */
 			ATTACH PARTITION qualified_name PartitionBoundSpec
@@ -2464,7 +2454,6 @@ partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = $4;
-					cmd->partlist = NIL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -2479,7 +2468,6 @@ partition_cmd:
 					n->subtype = AT_DetachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
-					cmd->partlist = NIL;
 					cmd->concurrent = $4;
 					n->def = (Node *) cmd;
 
@@ -2493,35 +2481,6 @@ partition_cmd:
 					n->subtype = AT_DetachPartitionFinalize;
 					cmd->name = $3;
 					cmd->bound = NULL;
-					cmd->partlist = NIL;
-					cmd->concurrent = false;
-					n->def = (Node *) cmd;
-					$$ = (Node *) n;
-				}
-			/* ALTER TABLE <name> SPLIT PARTITION <partition_name> INTO () */
-			| SPLIT PARTITION qualified_name INTO '(' partitions_list ')'
-				{
-					AlterTableCmd *n = makeNode(AlterTableCmd);
-					PartitionCmd *cmd = makeNode(PartitionCmd);
-
-					n->subtype = AT_SplitPartition;
-					cmd->name = $3;
-					cmd->bound = NULL;
-					cmd->partlist = $6;
-					cmd->concurrent = false;
-					n->def = (Node *) cmd;
-					$$ = (Node *) n;
-				}
-			/* ALTER TABLE <name> MERGE PARTITIONS () INTO <partition_name> */
-			| MERGE PARTITIONS '(' qualified_name_list ')' INTO qualified_name
-				{
-					AlterTableCmd *n = makeNode(AlterTableCmd);
-					PartitionCmd *cmd = makeNode(PartitionCmd);
-
-					n->subtype = AT_MergePartitions;
-					cmd->name = $7;
-					cmd->bound = NULL;
-					cmd->partlist = $4;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 					$$ = (Node *) n;
@@ -2538,7 +2497,6 @@ index_partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
-					cmd->partlist = NIL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -12585,25 +12543,25 @@ CreateConversionStmt:
  *****************************************************************************/
 
 RepackStmt:
-			REPACK opt_utility_option_list vacuum_relation USING INDEX name
+			REPACK opt_utility_option_list qualified_name opt_name_list USING INDEX name
 				{
 					RepackStmt *n = makeNode(RepackStmt);
 
 					n->command = REPACK_COMMAND_REPACK;
-					n->relation = (VacuumRelation *) $3;
-					n->indexname = $6;
+					n->relation = makeVacuumRelation($3, InvalidOid, $4);
+					n->indexname = $7;
 					n->usingindex = true;
 					n->params = $2;
 					$$ = (Node *) n;
 				}
-			| REPACK opt_utility_option_list vacuum_relation opt_usingindex
+			| REPACK opt_utility_option_list qualified_name opt_name_list opt_usingindex
 				{
 					RepackStmt *n = makeNode(RepackStmt);
 
 					n->command = REPACK_COMMAND_REPACK;
-					n->relation = (VacuumRelation *) $3;
+					n->relation = makeVacuumRelation($3, InvalidOid, $4);
 					n->indexname = NULL;
-					n->usingindex = $4;
+					n->usingindex = $5;
 					n->params = $2;
 					$$ = (Node *) n;
 				}
@@ -13751,7 +13709,6 @@ simple_select:
 					n->whereClause = $6;
 					n->groupClause = ($7)->list;
 					n->groupDistinct = ($7)->distinct;
-					n->groupByAll = ($7)->all;
 					n->havingClause = $8;
 					n->windowClause = $9;
 					$$ = (Node *) n;
@@ -13769,7 +13726,6 @@ simple_select:
 					n->whereClause = $6;
 					n->groupClause = ($7)->list;
 					n->groupDistinct = ($7)->distinct;
-					n->groupByAll = ($7)->all;
 					n->havingClause = $8;
 					n->windowClause = $9;
 					$$ = (Node *) n;
@@ -14267,16 +14223,7 @@ group_clause:
 					GroupClause *n = palloc_object(GroupClause);
 
 					n->distinct = $3 == SET_QUANTIFIER_DISTINCT;
-					n->all = false;
 					n->list = $4;
-					$$ = n;
-				}
-			| GROUP_P BY ALL
-				{
-					GroupClause *n = palloc_object(GroupClause);
-					n->distinct = false;
-					n->all = true;
-					n->list = NIL;
 					$$ = n;
 				}
 			| /*EMPTY*/
@@ -14284,7 +14231,6 @@ group_clause:
 					GroupClause *n = palloc_object(GroupClause);
 
 					n->distinct = false;
-					n->all = false;
 					n->list = NIL;
 					$$ = n;
 				}
@@ -15188,6 +15134,7 @@ json_table:
 				json_value_expr ',' a_expr json_table_path_name_opt
 				json_passing_clause_opt
 				COLUMNS '(' json_table_column_definition_list ')'
+				json_table_plan_clause_opt
 				json_on_error_clause_opt
 			')'
 				{
@@ -15199,13 +15146,15 @@ json_table:
 						castNode(A_Const, $5)->val.node.type != T_String)
 						ereport(ERROR,
 								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("only string constants are supported in JSON_TABLE path specification"),
+								errmsg("only string constants are supported in"
+									   " JSON_TABLE path specification"),
 								parser_errposition(@5));
 					pathstring = castNode(A_Const, $5)->val.sval.sval;
 					n->pathspec = makeJsonTablePathSpec(pathstring, $6, @5, @6);
 					n->passing = $7;
 					n->columns = $10;
-					n->on_error = (JsonBehavior *) $12;
+					n->planspec = (JsonTablePlanSpec *) $12;
+					n->on_error = (JsonBehavior *) $13;
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -15297,8 +15246,7 @@ json_table_column_definition:
 					JsonTableColumn *n = makeNode(JsonTableColumn);
 
 					n->coltype = JTC_NESTED;
-					n->pathspec = (JsonTablePathSpec *)
-						makeJsonTablePathSpec($3, NULL, @3, -1);
+					n->pathspec = makeJsonTablePathSpec($3, NULL, @3, -1);
 					n->columns = $6;
 					n->location = @1;
 					$$ = (Node *) n;
@@ -15309,8 +15257,7 @@ json_table_column_definition:
 					JsonTableColumn *n = makeNode(JsonTableColumn);
 
 					n->coltype = JTC_NESTED;
-					n->pathspec = (JsonTablePathSpec *)
-						makeJsonTablePathSpec($3, $5, @3, @5);
+					n->pathspec = makeJsonTablePathSpec($3, $5, @3, @5);
 					n->columns = $8;
 					n->location = @1;
 					$$ = (Node *) n;
@@ -15327,6 +15274,83 @@ json_table_column_path_clause_opt:
 				{ $$ = (Node *) makeJsonTablePathSpec($2, NULL, @2, -1); }
 			| /* EMPTY */
 				{ $$ = NULL; }
+		;
+
+json_table_plan_clause_opt:
+			PLAN '(' json_table_plan ')'
+				{ $$ = $3; }
+			| PLAN DEFAULT '(' json_table_default_plan_choices ')'
+				{ $$ = makeJsonTableDefaultPlan($4, @1); }
+			| /* EMPTY */
+				{ $$ = NULL; }
+		;
+
+json_table_plan:
+			json_table_plan_simple
+			| json_table_plan_outer
+			| json_table_plan_inner
+			| json_table_plan_union
+			| json_table_plan_cross
+		;
+
+json_table_plan_simple:
+			name
+				{ $$ = makeJsonTableSimplePlan($1, @1); }
+		;
+
+json_table_plan_outer:
+			json_table_plan_simple OUTER_P json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_OUTER, $1, $3, @1); }
+		;
+
+json_table_plan_inner:
+			json_table_plan_simple INNER_P json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_INNER, $1, $3, @1); }
+		;
+
+json_table_plan_union:
+			json_table_plan_primary UNION json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_UNION, $1, $3, @1); }
+			| json_table_plan_union UNION json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_UNION, $1, $3, @1); }
+		;
+
+json_table_plan_cross:
+			json_table_plan_primary CROSS json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_CROSS, $1, $3, @1); }
+			| json_table_plan_cross CROSS json_table_plan_primary
+				{ $$ = makeJsonTableJoinedPlan(JSTP_JOIN_CROSS, $1, $3, @1); }
+		;
+
+json_table_plan_primary:
+			json_table_plan_simple
+				{ $$ = $1; }
+			| '(' json_table_plan ')'
+				{
+					castNode(JsonTablePlanSpec, $2)->location = @1;
+					$$ = $2;
+				}
+		;
+
+json_table_default_plan_choices:
+			json_table_default_plan_inner_outer
+				{ $$ = $1 | JSTP_JOIN_UNION; }
+			| json_table_default_plan_union_cross
+				{ $$ = $1 | JSTP_JOIN_OUTER; }
+			| json_table_default_plan_inner_outer ',' json_table_default_plan_union_cross
+				{ $$ = $1 | $3; }
+			| json_table_default_plan_union_cross ',' json_table_default_plan_inner_outer
+				{ $$ = $1 | $3; }
+		;
+
+json_table_default_plan_inner_outer:
+			INNER_P						{ $$ = JSTP_JOIN_INNER; }
+			| OUTER_P					{ $$ = JSTP_JOIN_OUTER; }
+		;
+
+json_table_default_plan_union_cross:
+			UNION						{ $$ = JSTP_JOIN_UNION; }
+			| CROSS						{ $$ = JSTP_JOIN_CROSS; }
 		;
 
 /*****************************************************************************
@@ -15897,6 +15921,10 @@ a_expr:		c_expr									{ $$ = $1; }
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2); }
 			| a_expr NOT_EQUALS a_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2); }
+			| RIGHT_ARROW a_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "->", NULL, $2, @1); }
+			| '|' a_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "|", NULL, $2, @1); }
 			| a_expr RIGHT_ARROW a_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "->", $1, $3, @2); }
 			| a_expr '|' a_expr
@@ -16381,6 +16409,10 @@ b_expr:		c_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2); }
 			| b_expr NOT_EQUALS b_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2); }
+			| RIGHT_ARROW b_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "->", NULL, $2, @1); }
+			| '|' b_expr
+				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "|", NULL, $2, @1); }
 			| b_expr RIGHT_ARROW b_expr
 				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "->", $1, $3, @2); }
 			| b_expr '|' b_expr
@@ -18707,7 +18739,6 @@ PLpgSQL_Expr: opt_distinct_clause opt_target_list
 					n->whereClause = $4;
 					n->groupClause = ($5)->list;
 					n->groupDistinct = ($5)->distinct;
-					n->groupByAll = ($5)->all;
 					n->havingClause = $6;
 					n->windowClause = $7;
 					n->sortClause = $8;
@@ -19026,7 +19057,6 @@ unreserved_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
-			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -19101,7 +19131,6 @@ unreserved_keyword:
 			| SKIP
 			| SNAPSHOT
 			| SOURCE
-			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P
@@ -19670,7 +19699,6 @@ bare_label_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
-			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -19756,7 +19784,6 @@ bare_label_keyword:
 			| SNAPSHOT
 			| SOME
 			| SOURCE
-			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P

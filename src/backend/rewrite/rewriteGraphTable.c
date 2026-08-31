@@ -367,6 +367,8 @@ generate_queries_for_path_pattern_recurse(RangeTblEntry *rte, List *pathqueries,
 
 	foreach_ptr(struct path_element, pe, path_elems)
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		/* Update current path being built with current element. */
 		cur_path = lappend(cur_path, pe);
 
@@ -713,6 +715,13 @@ generate_setop_from_pathqueries(List *pathqueries, List **rtable, List **targetl
 	}
 
 	lquery = linitial_node(Query, pathqueries);
+
+	/*
+	 * Each path query will become a subquery of the UNION statement. So any
+	 * Vars that already refer outside the path query must be adjusted for
+	 * additional query level.
+	 */
+	IncrementVarSublevelsUp((Node *) lquery, 1, 1);
 
 	pni = addRangeTableEntryForSubquery(make_parsestate(NULL), lquery, NULL,
 										false, false);
@@ -1152,7 +1161,7 @@ replace_property_refs(Oid propgraphid, Node *node, const List *mappings)
 	context.mappings = mappings;
 	context.propgraphid = propgraphid;
 
-	return expression_tree_mutator(node, replace_property_refs_mutator, &context);
+	return replace_property_refs_mutator(node, &context);
 }
 
 /*
